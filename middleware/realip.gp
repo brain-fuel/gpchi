@@ -1,0 +1,34 @@
+package middleware
+
+import (
+	"net"
+	"net/http"
+	"strings"
+)
+
+// RealIP rewrites RemoteAddr from proxy headers for chi compatibility.
+//
+// Deprecated: forwarded headers are attacker-controlled unless a trusted proxy
+// overwrites them. Prefer a policy that explicitly names trusted proxies.
+func RealIP(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ip := realIP(r); ip != "" {
+			r.RemoteAddr = ip
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func realIP(r *http.Request) string {
+	ip := r.Header.Get("True-Client-IP")
+	if ip == "" {
+		ip = r.Header.Get("X-Real-IP")
+	}
+	if ip == "" {
+		ip, _, _ = strings.Cut(r.Header.Get("X-Forwarded-For"), ",")
+	}
+	if net.ParseIP(ip) == nil {
+		return ""
+	}
+	return ip
+}

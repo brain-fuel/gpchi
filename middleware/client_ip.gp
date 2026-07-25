@@ -1,0 +1,135 @@
+package middleware
+
+import (
+	"context"
+	"net"
+	"net/http"
+	"net/netip"
+	"strings"
+)
+
+type clientIPKey struct{}
+
+var storedClientIP clientIPKey
+
+func ClientIPFromHeader(name string) func(http.Handler) http.Handler {
+	name = http.CanonicalHeaderKey(name)
+	return storeClientIP(func(r *http.Request) (netip.Addr, bool) {
+		values := r.Header.Values(name)
+		if len(values) == 0 {
+			return netip.Addr{}, false
+		}
+		return parseForwardedIP(values[len(values)-1])
+	})
+}
+
+func ClientIPFromXFF(trustedPrefixes ...string) func(http.Handler) http.Handler {
+	trusted := make([]netip.Prefix, len(trustedPrefixes))
+	for index, prefix := range trustedPrefixes {
+		trusted[index] = netip.MustParsePrefix(prefix)
+	}
+	return storeClientIP(func(r *http.Request) (netip.Addr, bool) {
+		var client netip.Addr
+		walkForwardedFor(r.Header.Values("X-Forwarded-For"), func(entry string) bool {
+			ip, valid := parseForwardedIP(entry)
+			if !valid {
+				client = netip.Addr{}
+				return true
+			}
+			for _, prefix := range trusted {
+				if prefix.Contains(ip) {
+					return false
+				}
+			}
+			client = ip
+			return true
+		})
+		return client, client.IsValid()
+	})
+}
+
+func ClientIPFromXFFTrustedProxies(count int) func(http.Handler) http.Handler {
+	if count < 1 {
+		panic("middleware.ClientIPFromXFFTrustedProxies: numTrustedProxies must be >= 1")
+	}
+	return storeClientIP(func(r *http.Request) (netip.Addr, bool) {
+		remaining := count
+		candidate := ""
+		walkForwardedFor(r.Header.Values("X-Forwarded-For"), func(entry string) bool {
+			remaining--
+			if remaining == 0 {
+				candidate = entry
+				return true
+			}
+			return false
+		})
+		return parseForwardedIP(candidate)
+	})
+}
+
+func ClientIPFromRemoteAddr(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			host = r.RemoteAddr
+		}
+		if ip, err := netip.ParseAddr(host); err == nil {
+			r = withClientIP(r, ip.Unmap())
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func GetClientIP(ctx context.Context) string {
+	ip := GetClientIPAddr(ctx)
+	if !ip.IsValid() {
+		return ""
+	}
+	return ip.String()
+}
+
+func GetClientIPAddr(ctx context.Context) netip.Addr {
+	ip, _ := ctx.Value(storedClientIP).(netip.Addr)
+	return ip
+}
+
+func storeClientIP(extract func(*http.Request) (netip.Addr, bool)) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if ip, valid := extract(r); valid {
+				r = withClientIP(r, ip)
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func withClientIP(r *http.Request, ip netip.Addr) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), storedClientIP, ip))
+}
+
+func parseForwardedIP(value string) (netip.Addr, bool) {
+	ip, err := netip.ParseAddr(value)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	return ip.Unmap().WithZone(""), true
+}
+
+func walkForwardedFor(headers []string, visit func(string) bool) {
+	for headerIndex := len(headers) - 1; headerIndex >= 0; headerIndex-- {
+		rest := headers[headerIndex]
+		for rest != "" {
+			entry := rest
+			if comma := strings.LastIndexByte(rest, ','); comma >= 0 {
+				entry, rest = rest[comma+1:], rest[:comma]
+			} else {
+				rest = ""
+			}
+			entry = strings.TrimSpace(entry)
+			if entry != "" && visit(entry) {
+				return
+			}
+		}
+	}
+}

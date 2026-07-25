@@ -1,0 +1,1287 @@
+// Package chi provides a Go+-authored, bounded Chi-compatible registration facade backed by
+// immutable compiled route snapshots.
+package chi
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	stdroute "goforge.dev/goplus/std/http/route"
+)
+
+type Middlewares []func(http.Handler) http.Handler
+
+type Router interface {
+	http.Handler
+	Routes
+	Use(...func(http.Handler) http.Handler)
+	With(...func(http.Handler) http.Handler) Router
+	Group(func(Router)) Router
+	Route(string, func(Router)) Router
+	Mount(string, http.Handler)
+	Handle(string, http.Handler)
+	HandleFunc(string, http.HandlerFunc)
+	Method(string, string, http.Handler)
+	MethodFunc(string, string, http.HandlerFunc)
+	Connect(string, http.HandlerFunc)
+	Delete(string, http.HandlerFunc)
+	Get(string, http.HandlerFunc)
+	Head(string, http.HandlerFunc)
+	Options(string, http.HandlerFunc)
+	Patch(string, http.HandlerFunc)
+	Post(string, http.HandlerFunc)
+	Put(string, http.HandlerFunc)
+	Query(string, http.HandlerFunc)
+	Trace(string, http.HandlerFunc)
+	NotFound(http.HandlerFunc)
+	MethodNotAllowed(http.HandlerFunc)
+}
+
+type Routes interface {
+	Routes() []Route
+	Middlewares() Middlewares
+	Match(*Context, string, string) bool
+	Find(*Context, string, string) string
+}
+
+type Route struct {
+	SubRoutes Routes
+	Handlers  map[string]http.Handler
+	Pattern   string
+}
+
+// RouteInfo is immutable flat metadata for documentation and OpenAPI
+// generation without traversing private router nodes.
+type RouteInfo struct {
+	Method     string
+	Pattern    string
+	ParamNames []string
+	Handler    http.Handler
+	SubRoutes  Routes
+}
+
+// MatchOutcome is the exhaustive Go+ semantic lookup result. Compatibility
+// Match remains boolean, while new code must distinguish a route match, a
+// method mismatch, and an absent route without executing a handler.
+type MatchOutcome enum {
+	MatchedRoute(Route RouteInfo, Params map[string]string)
+	MethodMismatch(Allowed []string)
+	RouteMissing
+}
+
+type ConflictKind uint8
+
+const (
+	DuplicateRoute ConflictKind = iota + 1
+	AmbiguousRoute
+)
+
+type Conflict struct {
+	Kind   ConflictKind
+	Method string
+	Left   string
+	Right  string
+}
+
+func (c Conflict) Error() string {
+	return fmt.Sprintf("chi: %s routes %s %q and %q", map[ConflictKind]string{DuplicateRoute: "duplicate", AmbiguousRoute: "ambiguous"}[c.Kind], c.Method, c.Left, c.Right)
+}
+
+type segmentKind uint8
+
+const (
+	staticSegment segmentKind = iota
+	parameterSegment
+	regexSegment
+	wildcardSegment
+)
+
+type segment struct {
+	kind           segmentKind
+	literal, name  string
+	expression     *regexp.Regexp
+	names          []string
+	captureIndices []int
+	shapeText      string
+}
+type compiledRoute struct {
+	RouteInfo
+	segments    []segment
+	specificity int
+}
+
+type scopedHandler struct {
+	prefix  string
+	handler http.Handler
+}
+
+type Snapshot struct {
+	exact            map[string]http.Handler
+	dynamic          map[string][]compiledRoute
+	methods          map[string]bool
+	routes           []RouteInfo
+	notFound         http.Handler
+	methodNotAllowed http.Handler
+	customNotFound   bool
+	customMethodNA   bool
+	scopedNotFound   []scopedHandler
+	scopedMethodNA   []scopedHandler
+	middleware       http.Handler
+	middlewareList   Middlewares
+}
+
+type Mux struct {
+	mu               sync.Mutex
+	routes           []RouteInfo
+	middlewares      Middlewares
+	parent           *Mux
+	local            Middlewares
+	prefix           string
+	notFound         http.HandlerFunc
+	methodNotAllowed http.HandlerFunc
+	scopedNotFound   []scopedHandler
+	scopedMethodNA   []scopedHandler
+	compiled         atomic.Pointer[Snapshot]
+	sealed           bool
+	mounts           map[string]bool
+}
+
+func NewRouter() *Mux { return &Mux{} }
+func NewMux() *Mux    { return NewRouter() }
+
+var registeredMethods = struct {
+	sync.RWMutex
+	values map[string]bool
+}{values: map[string]bool{
+	http.MethodConnect: true, http.MethodDelete: true, http.MethodGet: true,
+	http.MethodHead: true, http.MethodOptions: true, http.MethodPatch: true,
+	http.MethodPost: true, http.MethodPut: true, "QUERY": true,
+	http.MethodTrace: true,
+}}
+
+func RegisterMethod(method string) {
+	if method == "" {
+		return
+	}
+	registeredMethods.Lock()
+	registeredMethods.values[strings.ToUpper(method)] = true
+	registeredMethods.Unlock()
+}
+
+func routeKey(method, path string) string { return method + "\x00" + path }
+
+func entirePlaceholder(text string) bool {
+	if len(text) < 2 || text[0] != '{' {
+		return false
+	}
+	depth := 0
+	escaped := false
+	for index := 0; index < len(text); index++ {
+		switch {
+		case escaped:
+			escaped = false
+		case text[index] == '\\':
+			escaped = true
+		case text[index] == '{':
+			depth++
+		case text[index] == '}':
+			depth--
+			if depth == 0 {
+				return index == len(text)-1
+			}
+		}
+	}
+	return false
+}
+
+func parseCompositeSegment(text string) (segment, []string, error) {
+	var expression strings.Builder
+	var shape strings.Builder
+	names := make([]string, 0)
+	captureNames := make([]string, 0)
+	for cursor := 0; cursor < len(text); {
+		openOffset := strings.IndexByte(text[cursor:], '{')
+		if openOffset < 0 {
+			literal := text[cursor:]
+			if strings.ContainsAny(literal, "{}") {
+				return segment{}, nil, fmt.Errorf("chi: malformed route segment %q", text)
+			}
+			expression.WriteString(regexp.QuoteMeta(literal))
+			shape.WriteString(literal)
+			break
+		}
+		open := cursor + openOffset
+		literal := text[cursor:open]
+		if strings.ContainsAny(literal, "{}") {
+			return segment{}, nil, fmt.Errorf("chi: malformed route segment %q", text)
+		}
+		expression.WriteString(regexp.QuoteMeta(literal))
+		shape.WriteString(literal)
+		depth, close := 1, -1
+		escaped := false
+		for index := open + 1; index < len(text); index++ {
+			switch {
+			case escaped:
+				escaped = false
+			case text[index] == '\\':
+				escaped = true
+			case text[index] == '{':
+				depth++
+			case text[index] == '}':
+				depth--
+				if depth == 0 {
+					close = index
+					index = len(text)
+				}
+			}
+		}
+		if close < 0 {
+			return segment{}, nil, fmt.Errorf("chi: malformed route segment %q", text)
+		}
+		body := text[open+1 : close]
+		name, constraint, constrained := strings.Cut(body, ":")
+		if name == "" {
+			return segment{}, nil, fmt.Errorf("chi: empty route parameter in %q", text)
+		}
+		if !constrained {
+			constraint = "[^/]+?"
+		} else if constraint == "*" || constraint == ".*" {
+			return segment{}, nil, fmt.Errorf("chi: wildcard must occupy the final route segment in %q", text)
+		}
+		captureName := fmt.Sprintf("__goforge_route_%d", len(names))
+		expression.WriteString("(?P<")
+		expression.WriteString(captureName)
+		expression.WriteString(">")
+		expression.WriteString(constraint)
+		expression.WriteByte(')')
+		shape.WriteString("{}")
+		names = append(names, name)
+		captureNames = append(captureNames, captureName)
+		cursor = close + 1
+	}
+	compiled, err := regexp.Compile("^(?:" + expression.String() + ")$")
+	if err != nil {
+		return segment{}, nil, fmt.Errorf("chi: invalid parameter expression in %q: %w", text, err)
+	}
+	indices := make([]int, len(captureNames))
+	for index, captureName := range captureNames {
+		indices[index] = compiled.SubexpIndex(captureName)
+	}
+	return segment{
+		kind: regexSegment, expression: compiled, names: names,
+		captureIndices: indices, shapeText: shape.String(),
+	}, names, nil
+}
+
+func parsePattern(pattern string) ([]segment, []string, error) {
+	if pattern == "" || pattern[0] != '/' {
+		return nil, nil, fmt.Errorf("chi: route pattern must begin with '/': %q", pattern)
+	}
+	if pattern == "/" {
+		return nil, nil, nil
+	}
+	parts := strings.Split(strings.TrimPrefix(pattern, "/"), "/")
+	segments := make([]segment, 0, len(parts))
+	names := make([]string, 0)
+	seen := map[string]bool{}
+	for i, part := range parts {
+		s := segment{kind: staticSegment, literal: part}
+		switch {
+		case part == "*":
+			s.kind, s.name = wildcardSegment, "*"
+		case entirePlaceholder(part):
+			body := part[1 : len(part)-1]
+			name, expression, found := strings.Cut(body, ":")
+			if name == "" {
+				return nil, nil, fmt.Errorf("chi: empty route parameter in %q", pattern)
+			}
+			s.name = name
+			if !found {
+				s.kind = parameterSegment
+			} else if expression == "*" || expression == ".*" {
+				s.kind = wildcardSegment
+			} else {
+				re, err := regexp.Compile("^(?:" + expression + ")$")
+				if err != nil {
+					return nil, nil, fmt.Errorf("chi: invalid parameter expression in %q: %w", pattern, err)
+				}
+				s.kind, s.expression = regexSegment, re
+			}
+		case strings.Contains(part, "{"):
+			composite, compositeNames, err := parseCompositeSegment(part)
+			if err != nil {
+				return nil, nil, err
+			}
+			s = composite
+			for _, name := range compositeNames {
+				if seen[name] {
+					return nil, nil, fmt.Errorf("chi: duplicate parameter %q in %q", name, pattern)
+				}
+				seen[name] = true
+				names = append(names, name)
+			}
+		default:
+			if strings.ContainsAny(part, "{}") {
+				return nil, nil, fmt.Errorf("chi: malformed route segment %q", part)
+			}
+		}
+		if s.kind == wildcardSegment && i != len(parts)-1 {
+			return nil, nil, fmt.Errorf("chi: wildcard must be the final route segment in %q", pattern)
+		}
+		if s.kind != staticSegment && len(s.names) == 0 {
+			if seen[s.name] {
+				return nil, nil, fmt.Errorf("chi: duplicate parameter %q in %q", s.name, pattern)
+			}
+			seen[s.name] = true
+			names = append(names, s.name)
+			if s.kind == wildcardSegment && i != len(parts)-1 {
+				return nil, nil, fmt.Errorf("chi: wildcard must be final in %q", pattern)
+			}
+		}
+		segments = append(segments, s)
+	}
+	return segments, names, nil
+}
+
+func exactPattern(segments []segment) bool {
+	for _, s := range segments {
+		if s.kind != staticSegment {
+			return false
+		}
+	}
+	return true
+}
+func shape(segments []segment) string {
+	var b strings.Builder
+	for _, s := range segments {
+		b.WriteByte('/')
+		switch s.kind {
+		case staticSegment:
+			b.WriteString(s.literal)
+		case parameterSegment:
+			b.WriteString("{}")
+		case regexSegment:
+			if s.shapeText != "" {
+				b.WriteString(s.shapeText)
+			} else {
+				b.WriteString("{}")
+			}
+		case wildcardSegment:
+			b.WriteByte('*')
+		}
+	}
+	return b.String()
+}
+
+func compile(routes []RouteInfo, middlewares Middlewares, notFound, methodNotAllowed http.Handler) (*Snapshot, []Conflict) {
+	s := &Snapshot{
+		exact: map[string]http.Handler{}, dynamic: map[string][]compiledRoute{},
+		methods: map[string]bool{}, routes: make([]RouteInfo, 0, len(routes)),
+		notFound: notFound, methodNotAllowed: methodNotAllowed,
+		middlewareList: append(Middlewares(nil), middlewares...),
+	}
+	var conflicts []Conflict
+	seen := map[string]compiledRoute{}
+	shaped := map[string]compiledRoute{}
+	for _, route := range routes {
+		segments, names, err := parsePattern(route.Pattern)
+		if err != nil {
+			conflicts = append(conflicts, Conflict{AmbiguousRoute, route.Method, route.Pattern, err.Error()})
+			continue
+		}
+		handler := route.Handler
+		cr := compiledRoute{RouteInfo: RouteInfo{
+			Method: strings.ToUpper(route.Method), Pattern: route.Pattern,
+			ParamNames: append([]string(nil), names...), Handler: handler,
+			SubRoutes: route.SubRoutes,
+		}, segments: segments}
+		for _, seg := range segments {
+			switch seg.kind {
+			case staticSegment:
+				cr.specificity += 4
+			case regexSegment:
+				cr.specificity += 3
+			case parameterSegment:
+				cr.specificity += 2
+			case wildcardSegment:
+				cr.specificity++
+			}
+		}
+		key := routeKey(cr.Method, cr.Pattern)
+		if prior, ok := seen[key]; ok {
+			conflicts = append(conflicts, Conflict{DuplicateRoute, cr.Method, prior.Pattern, cr.Pattern})
+			continue
+		}
+		seen[key] = cr
+		shapeKey := routeKey(cr.Method, shape(segments))
+		if prior, ok := shaped[shapeKey]; ok && prior.Pattern != cr.Pattern {
+			conflicts = append(conflicts, Conflict{AmbiguousRoute, cr.Method, prior.Pattern, cr.Pattern})
+		} else {
+			shaped[shapeKey] = cr
+		}
+		s.methods[cr.Method] = true
+		s.routes = append(s.routes, cr.RouteInfo)
+		if exactPattern(segments) {
+			s.exact[key] = handler
+		} else {
+			s.dynamic[cr.Method] = append(s.dynamic[cr.Method], cr)
+		}
+	}
+	for method := range s.dynamic {
+		sort.SliceStable(s.dynamic[method], func(i, j int) bool { return s.dynamic[method][i].specificity > s.dynamic[method][j].specificity })
+	}
+	if len(middlewares) != 0 {
+		var dispatcher http.Handler = http.HandlerFunc(s.serveHTTP)
+		for i := len(middlewares) - 1; i >= 0; i-- {
+			dispatcher = middlewares[i](dispatcher)
+		}
+		s.middleware = dispatcher
+	}
+	return s, conflicts
+}
+
+func (m *Mux) Compile() (*Snapshot, []Conflict) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	nf := http.Handler(http.NotFoundHandler())
+	if m.notFound != nil {
+		nf = m.notFound
+	}
+	mna := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	if m.methodNotAllowed != nil {
+		mna = m.methodNotAllowed
+	}
+	s, conflicts := compile(append([]RouteInfo(nil), m.routes...), append(Middlewares(nil), m.middlewares...), nf, mna)
+	s.customNotFound = m.notFound != nil
+	s.customMethodNA = m.methodNotAllowed != nil
+	s.scopedNotFound = append([]scopedHandler(nil), m.scopedNotFound...)
+	s.scopedMethodNA = append([]scopedHandler(nil), m.scopedMethodNA...)
+	if len(conflicts) == 0 {
+		m.compiled.Store(s)
+	}
+	return s, conflicts
+}
+
+func (m *Mux) snapshot() *Snapshot {
+	if s := m.compiled.Load(); s != nil {
+		return s
+	}
+	s, conflicts := m.Compile()
+	if len(conflicts) != 0 {
+		s = m.compatibilitySnapshot()
+	}
+	m.compiled.Store(s)
+	return s
+}
+
+func (m *Mux) compatibilitySnapshot() *Snapshot {
+	root := m.root()
+	root.mu.Lock()
+	defer root.mu.Unlock()
+	kept := make([]RouteInfo, 0, len(root.routes))
+	positions := make(map[string]int, len(root.routes))
+	for _, route := range root.routes {
+		segments, _, err := parsePattern(route.Pattern)
+		if err != nil {
+			panic(err)
+		}
+		key := routeKey(strings.ToUpper(route.Method), compatibilityShape(segments))
+		if position, exists := positions[key]; exists {
+			kept[position] = route
+			continue
+		}
+		positions[key] = len(kept)
+		kept = append(kept, route)
+	}
+	notFound := http.Handler(http.NotFoundHandler())
+	if root.notFound != nil {
+		notFound = root.notFound
+	}
+	methodNotAllowed := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	if root.methodNotAllowed != nil {
+		methodNotAllowed = root.methodNotAllowed
+	}
+	snapshot, _ := compile(
+		kept, append(Middlewares(nil), root.middlewares...),
+		notFound, methodNotAllowed,
+	)
+	snapshot.customNotFound = root.notFound != nil
+	snapshot.customMethodNA = root.methodNotAllowed != nil
+	snapshot.scopedNotFound = append([]scopedHandler(nil), root.scopedNotFound...)
+	snapshot.scopedMethodNA = append([]scopedHandler(nil), root.scopedMethodNA...)
+	return snapshot
+}
+
+func compatibilityShape(segments []segment) string {
+	var builder strings.Builder
+	for _, segment := range segments {
+		builder.WriteByte('/')
+		switch segment.kind {
+		case staticSegment:
+			builder.WriteString(segment.literal)
+		case parameterSegment:
+			builder.WriteString("{}")
+		case regexSegment:
+			if segment.shapeText != "" {
+				builder.WriteString(segment.shapeText)
+			} else {
+				builder.WriteByte('{')
+				builder.WriteString(segment.expression.String())
+				builder.WriteByte('}')
+			}
+		case wildcardSegment:
+			builder.WriteByte('*')
+		}
+	}
+	return builder.String()
+}
+func (m *Mux) invalidate() { m.compiled.Store(nil) }
+
+func (m *Mux) root() *Mux {
+	if m.parent != nil {
+		return m.parent.root()
+	}
+	return m
+}
+func (m *Mux) Method(method, pattern string, handler http.Handler) {
+	if handler == nil {
+		panic("chi: nil handler")
+	}
+	originalMethod := method
+	method = strings.ToUpper(method)
+	registeredMethods.RLock()
+	supported := registeredMethods.values[method]
+	registeredMethods.RUnlock()
+	if !supported {
+		panic(fmt.Sprintf("chi: '%s' http method is not supported.", originalMethod))
+	}
+	if _, _, err := parsePattern(pattern); err != nil {
+		panic(err)
+	}
+	if m.parent != nil {
+		m.mu.Lock()
+		m.sealed = true
+		if len(m.local) != 0 {
+			handler = Chain(m.local...).Handler(handler)
+		}
+		m.mu.Unlock()
+		root := m.root()
+		root.mu.Lock()
+		defer root.mu.Unlock()
+		root.routes = append(root.routes, RouteInfo{Method: method, Pattern: m.prefix + pattern, Handler: handler})
+		root.invalidate()
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sealed = true
+	m.routes = append(m.routes, RouteInfo{Method: method, Pattern: m.prefix + pattern, Handler: handler})
+	m.invalidate()
+}
+func (m *Mux) MethodFunc(method, pattern string, handler http.HandlerFunc) {
+	m.Method(method, pattern, handler)
+}
+func (m *Mux) Handle(pattern string, handler http.Handler) {
+	if index := strings.IndexAny(pattern, " \t"); index >= 0 {
+		method := pattern[:index]
+		route := strings.TrimLeft(pattern[index+1:], " \t")
+		m.Method(method, route, handler)
+		return
+	}
+	if handler == nil {
+		panic("chi: nil handler")
+	}
+	if _, _, err := parsePattern(pattern); err != nil {
+		panic(err)
+	}
+	if m.parent != nil {
+		m.mu.Lock()
+		m.sealed = true
+		if len(m.local) != 0 {
+			handler = Chain(m.local...).Handler(handler)
+		}
+		m.mu.Unlock()
+		root := m.root()
+		root.mu.Lock()
+		defer root.mu.Unlock()
+		root.routes = append(root.routes, RouteInfo{Method: "*", Pattern: m.prefix + pattern, Handler: handler})
+		root.invalidate()
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sealed = true
+	m.routes = append(m.routes, RouteInfo{Method: "*", Pattern: m.prefix + pattern, Handler: handler})
+	m.invalidate()
+}
+func (m *Mux) HandleFunc(pattern string, handler http.HandlerFunc) { m.Handle(pattern, handler) }
+func (m *Mux) Connect(p string, h http.HandlerFunc)                { m.MethodFunc(http.MethodConnect, p, h) }
+func (m *Mux) Delete(p string, h http.HandlerFunc)                 { m.MethodFunc(http.MethodDelete, p, h) }
+func (m *Mux) Get(p string, h http.HandlerFunc)                    { m.MethodFunc(http.MethodGet, p, h) }
+func (m *Mux) Head(p string, h http.HandlerFunc)                   { m.MethodFunc(http.MethodHead, p, h) }
+func (m *Mux) Options(p string, h http.HandlerFunc)                { m.MethodFunc(http.MethodOptions, p, h) }
+func (m *Mux) Patch(p string, h http.HandlerFunc)                  { m.MethodFunc(http.MethodPatch, p, h) }
+func (m *Mux) Post(p string, h http.HandlerFunc)                   { m.MethodFunc(http.MethodPost, p, h) }
+func (m *Mux) Put(p string, h http.HandlerFunc)                    { m.MethodFunc(http.MethodPut, p, h) }
+func (m *Mux) Query(p string, h http.HandlerFunc)                  { m.MethodFunc("QUERY", p, h) }
+func (m *Mux) Trace(p string, h http.HandlerFunc)                  { m.MethodFunc(http.MethodTrace, p, h) }
+
+// Typed registers the Go+-authored pattern-indexed handler boundary. Go+
+// statically requires the handler and its parameter keys to share the pattern
+// index; this facade consumes the erased ordinary-Go handler.
+func (m *Mux) Typed(method string, pattern stdroute.Pattern, handler stdroute.Handler) {
+	m.Method(method, stdroute.Text(pattern), stdroute.Adapt(pattern, handler))
+}
+
+// UseCapability consumes capability-indexed Go+ middleware at the ordinary-Go
+// compatibility boundary.
+func (m *Mux) UseCapability(middleware stdroute.Middleware) { m.Use(stdroute.Wrap(middleware)) }
+
+func (m *Mux) Use(middlewares ...func(http.Handler) http.Handler) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.sealed {
+		panic("chi: all middlewares must be defined before routes on a mux")
+	}
+	if m.parent != nil {
+		m.local = append(m.local, middlewares...)
+		return
+	}
+	m.middlewares = append(m.middlewares, middlewares...)
+	m.invalidate()
+}
+func (m *Mux) With(middlewares ...func(http.Handler) http.Handler) Router {
+	return &Mux{parent: m.root(), prefix: m.prefix, local: append(append(Middlewares(nil), m.local...), middlewares...)}
+}
+func (m *Mux) Group(fn func(Router)) Router {
+	child := &Mux{parent: m.root(), prefix: m.prefix, local: append(Middlewares(nil), m.local...)}
+	fn(child)
+	return child
+}
+func (m *Mux) Route(pattern string, fn func(Router)) Router {
+	child := &Mux{parent: m.root(), prefix: m.prefix + pattern, local: append(Middlewares(nil), m.local...)}
+	fn(child)
+	return child
+}
+func (m *Mux) Mount(pattern string, handler http.Handler) {
+	if handler == nil {
+		panic(fmt.Sprintf("chi: attempting to Mount() a nil handler on '%s'", pattern))
+	}
+	prefix := strings.TrimSuffix(pattern, "/")
+	root := m.root()
+	root.mu.Lock()
+	if root.mounts == nil {
+		root.mounts = make(map[string]bool)
+	}
+	if root.mounts[m.prefix+prefix] {
+		root.mu.Unlock()
+		panic(fmt.Sprintf("chi: attempting to Mount() a handler on an existing path, '%s'", pattern))
+	}
+	root.mounts[m.prefix+prefix] = true
+	root.mu.Unlock()
+
+	subroutes, _ := handler.(Routes)
+	mountHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		routeContext := RouteContext(r.Context())
+		if routeContext != nil {
+			currentPath := routeContext.RoutePath
+			if currentPath == "" {
+				currentPath = r.URL.Path
+			}
+			if last := len(routeContext.RoutePatterns) - 1; last >= 0 {
+				routeContext.RoutePatterns[last] = prefix
+			}
+			remaining := strings.TrimPrefix(currentPath, prefix)
+			if remaining == "" {
+				remaining = "/"
+			}
+			routeContext.RoutePath = remaining
+			if subroutes != nil {
+				routeContext.Routes = subroutes
+			}
+			parentSnapshot := root.snapshot()
+			if routeContext.notFound == nil || parentSnapshot.customNotFound {
+				routeContext.notFound = parentSnapshot.notFound
+			}
+			if routeContext.methodNotAllowed == nil || parentSnapshot.customMethodNA {
+				routeContext.methodNotAllowed = parentSnapshot.methodNotAllowed
+			}
+			last := len(routeContext.URLParams.Keys) - 1
+			if last >= 0 && routeContext.URLParams.Keys[last] == "*" &&
+				len(routeContext.URLParams.Values) > last {
+				routeContext.URLParams.Values[last] = ""
+			}
+		}
+		handler.ServeHTTP(w, r)
+	})
+	m.Handle(prefix+"/*", mountHandler)
+	if subroutes != nil {
+		root.mu.Lock()
+		if len(root.routes) != 0 {
+			root.routes[len(root.routes)-1].SubRoutes = subroutes
+		}
+		root.invalidate()
+		root.mu.Unlock()
+	}
+}
+func (m *Mux) NotFound(handler http.HandlerFunc) {
+	if m.parent != nil {
+		for i := len(m.local) - 1; i >= 0; i-- {
+			handler = m.local[i](handler).ServeHTTP
+		}
+		root := m.root()
+		root.mu.Lock()
+		defer root.mu.Unlock()
+		if m.prefix != "" {
+			root.scopedNotFound = replaceScopedHandler(root.scopedNotFound, m.prefix, handler)
+			root.invalidate()
+			return
+		}
+		root.notFound = handler
+		root.invalidate()
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.notFound = handler
+	m.invalidate()
+}
+func (m *Mux) MethodNotAllowed(handler http.HandlerFunc) {
+	if m.parent != nil {
+		for i := len(m.local) - 1; i >= 0; i-- {
+			handler = m.local[i](handler).ServeHTTP
+		}
+		root := m.root()
+		root.mu.Lock()
+		defer root.mu.Unlock()
+		if m.prefix != "" {
+			root.scopedMethodNA = replaceScopedHandler(root.scopedMethodNA, m.prefix, handler)
+			root.invalidate()
+			return
+		}
+		root.methodNotAllowed = handler
+		root.invalidate()
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.methodNotAllowed = handler
+	m.invalidate()
+}
+
+func replaceScopedHandler(handlers []scopedHandler, prefix string, handler http.Handler) []scopedHandler {
+	for index := range handlers {
+		if handlers[index].prefix == prefix {
+			handlers[index].handler = handler
+			return handlers
+		}
+	}
+	return append(handlers, scopedHandler{prefix: prefix, handler: handler})
+}
+
+func scopedFallback(handlers []scopedHandler, path string) http.Handler {
+	var selected http.Handler
+	longest := -1
+	for _, candidate := range handlers {
+		if (path == candidate.prefix || strings.HasPrefix(path, candidate.prefix+"/")) &&
+			len(candidate.prefix) > longest {
+			selected = candidate.handler
+			longest = len(candidate.prefix)
+		}
+	}
+	return selected
+}
+func (m *Mux) NotFoundHandler() http.HandlerFunc {
+	root := m.root()
+	root.mu.Lock()
+	defer root.mu.Unlock()
+	if root.notFound != nil {
+		return root.notFound
+	}
+	return http.NotFound
+}
+
+// MethodNotAllowedHandler returns the configured 405 handler or Chi's default
+// zero-argument responder. Upstream's variadic element type is private, so
+// external consumers can only call the public method without arguments.
+func (m *Mux) MethodNotAllowedHandler() http.HandlerFunc {
+	root := m.root()
+	root.mu.Lock()
+	defer root.mu.Unlock()
+	if root.methodNotAllowed != nil {
+		return root.methodNotAllowed
+	}
+	return func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (m *Mux) Middlewares() Middlewares {
+	root := m.root()
+	root.mu.Lock()
+	defer root.mu.Unlock()
+	return append(Middlewares(nil), root.middlewares...)
+}
+func (m *Mux) Routes() []Route { return m.root().snapshot().Routes() }
+
+type contextKey struct{ name string }
+
+func (k *contextKey) String() string { return "chi context value " + k.name }
+
+type Context struct {
+	Routes        Routes
+	RoutePath     string
+	RouteMethod   string
+	URLParams     RouteParams
+	RoutePatterns []string
+	routePattern  string
+	notFound      http.Handler
+	methodNotAllowed http.Handler
+}
+type RouteParams struct{ Keys, Values []string }
+
+func (s *RouteParams) Add(key, value string) {
+	s.Keys = append(s.Keys, key)
+	s.Values = append(s.Values, value)
+}
+
+func (x *Context) Reset() {
+	x.URLParams.Keys = x.URLParams.Keys[:0]
+	x.URLParams.Values = x.URLParams.Values[:0]
+	x.Routes = nil
+	x.RoutePath = ""
+	x.RouteMethod = ""
+	x.RoutePatterns = x.RoutePatterns[:0]
+	x.routePattern = ""
+	x.notFound = nil
+	x.methodNotAllowed = nil
+}
+func (x *Context) URLParam(key string) string {
+	for i := len(x.URLParams.Keys) - 1; i >= 0; i-- {
+		if x.URLParams.Keys[i] == key {
+			return x.URLParams.Values[i]
+		}
+	}
+	return ""
+}
+
+func (x *Context) RoutePattern() string {
+	if x == nil {
+		return ""
+	}
+	routePattern := strings.Join(x.RoutePatterns, "")
+	for strings.Contains(routePattern, "/*/") {
+		routePattern = strings.ReplaceAll(routePattern, "/*/", "/")
+	}
+	if routePattern != "/" {
+		routePattern = strings.TrimSuffix(routePattern, "//")
+		routePattern = strings.TrimSuffix(routePattern, "/")
+	}
+	if routePattern != "" {
+		return routePattern
+	}
+	return x.routePattern
+}
+
+var RouteCtxKey = &contextKey{name: "RouteContext"}
+
+func NewRouteContext() *Context                 { return &Context{} }
+func RouteContext(ctx context.Context) *Context { x, _ := ctx.Value(RouteCtxKey).(*Context); return x }
+
+var routeContextPool = sync.Pool{New: func() any { return NewRouteContext() }}
+
+func acquireRouteContext(routes Routes) *Context {
+	ctx := routeContextPool.Get().(*Context)
+	ctx.Routes = routes
+	return ctx
+}
+
+func releaseRouteContext(ctx *Context) {
+	ctx.Reset()
+	routeContextPool.Put(ctx)
+}
+func URLParam(r *http.Request, key string) string {
+	if x := RouteContext(r.Context()); x != nil {
+		return x.URLParam(key)
+	}
+	return ""
+}
+func URLParamFromCtx(ctx context.Context, key string) string {
+	if x := RouteContext(ctx); x != nil {
+		return x.URLParam(key)
+	}
+	return ""
+}
+
+func (s *Snapshot) Routes() []Route {
+	out := make([]Route, len(s.routes))
+	for i, info := range s.routes {
+		handlers := map[string]http.Handler{info.Method: info.Handler}
+		if info.Method == "*" && info.SubRoutes == nil {
+			handlers = make(map[string]http.Handler)
+			registeredMethods.RLock()
+			for method := range registeredMethods.values {
+				handlers[method] = info.Handler
+			}
+			registeredMethods.RUnlock()
+		}
+		out[i] = Route{
+			Pattern: info.Pattern, SubRoutes: info.SubRoutes,
+			Handlers: handlers,
+		}
+	}
+	return out
+}
+func (s *Snapshot) Middlewares() Middlewares {
+	return append(Middlewares(nil), s.middlewareList...)
+}
+func (s *Snapshot) Find(ctx *Context, method, path string) string {
+	if s.Match(ctx, method, path) {
+		return ctx.routePattern
+	}
+	return ""
+}
+func (s *Snapshot) Metadata() []RouteInfo {
+	out := make([]RouteInfo, len(s.routes))
+	copy(out, s.routes)
+	for i := range out {
+		out[i].ParamNames = append([]string(nil), out[i].ParamNames...)
+	}
+	return out
+}
+func (s *Snapshot) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if s.middleware != nil {
+		if RouteContext(r.Context()) == nil {
+			ctx := acquireRouteContext(s)
+			defer releaseRouteContext(ctx)
+			r = r.WithContext(context.WithValue(r.Context(), RouteCtxKey, ctx))
+		}
+		s.middleware.ServeHTTP(w, r)
+		return
+	}
+	s.serveHTTP(w, r)
+}
+
+func (s *Snapshot) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path
+	if r.URL.RawPath != "" {
+		path = r.URL.EscapedPath()
+	}
+	method := r.Method
+	ctx := RouteContext(r.Context())
+	if ctx == nil {
+		if handler, ok := s.exact[routeKey(method, path)]; ok {
+			handler.ServeHTTP(w, r)
+			return
+		}
+		if handler, ok := s.exact[routeKey("*", path)]; ok {
+			handler.ServeHTTP(w, r)
+			return
+		}
+		ctx = acquireRouteContext(s)
+		defer releaseRouteContext(ctx)
+	} else {
+		if ctx.RoutePath != "" {
+			path = ctx.RoutePath
+		}
+		if ctx.RouteMethod != "" {
+			method = ctx.RouteMethod
+		}
+	}
+	if handler, ok := s.exact[routeKey(method, path)]; ok {
+		ctx.routePattern = path
+		ctx.RoutePatterns = append(ctx.RoutePatterns, path)
+		handler.ServeHTTP(w, r)
+		return
+	}
+	if handler, ok := s.exact[routeKey("*", path)]; ok {
+		ctx.routePattern = path
+		ctx.RoutePatterns = append(ctx.RoutePatterns, path)
+		handler.ServeHTTP(w, r)
+		return
+	}
+	if handler := s.match(ctx, method, path); handler != nil {
+		ctx.RoutePatterns = append(ctx.RoutePatterns, ctx.routePattern)
+		for index, key := range ctx.URLParams.Keys {
+			if index < len(ctx.URLParams.Values) {
+				r.SetPathValue(key, ctx.URLParams.Values[index])
+			}
+		}
+		if RouteContext(r.Context()) == nil {
+			r = r.WithContext(context.WithValue(r.Context(), RouteCtxKey, ctx))
+		}
+		handler.ServeHTTP(w, r)
+		return
+	}
+	if allowed := s.allowedMethods(path); len(allowed) != 0 {
+		for _, allowedMethod := range allowed {
+			w.Header().Add("Allow", allowedMethod)
+		}
+		handler := s.methodNotAllowed
+		if scoped := scopedFallback(s.scopedMethodNA, path); scoped != nil {
+			handler = scoped
+		} else if !s.customMethodNA && ctx.methodNotAllowed != nil {
+			handler = ctx.methodNotAllowed
+		}
+		handler.ServeHTTP(w, r)
+		return
+	}
+	handler := s.notFound
+	if scoped := scopedFallback(s.scopedNotFound, path); scoped != nil {
+		handler = scoped
+	} else if !s.customNotFound && ctx.notFound != nil {
+		handler = ctx.notFound
+	}
+	handler.ServeHTTP(w, r)
+}
+func (m *Mux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	snapshot := m.root().snapshot()
+	if snapshot.middleware != nil || RouteContext(r.Context()) != nil {
+		snapshot.ServeHTTP(w, r)
+		return
+	}
+	ctx := acquireRouteContext(snapshot)
+	defer releaseRouteContext(ctx)
+	r = r.WithContext(context.WithValue(r.Context(), RouteCtxKey, ctx))
+	snapshot.serveHTTP(w, r)
+}
+
+func matchRoute(route compiledRoute, path string, ctx *Context) bool {
+	keyStart, valueStart := len(ctx.URLParams.Keys), len(ctx.URLParams.Values)
+	fail := func() bool {
+		ctx.URLParams.Keys = ctx.URLParams.Keys[:keyStart]
+		ctx.URLParams.Values = ctx.URLParams.Values[:valueStart]
+		return false
+	}
+	remaining := strings.TrimPrefix(path, "/")
+	terminalEmpty := path != "/" && strings.HasSuffix(path, "/")
+	for _, seg := range route.segments {
+		if seg.kind == wildcardSegment {
+			ctx.URLParams.Keys = append(ctx.URLParams.Keys, seg.name)
+			ctx.URLParams.Values = append(ctx.URLParams.Values, remaining)
+			remaining = ""
+			terminalEmpty = false
+			break
+		}
+		if remaining == "" {
+			if !terminalEmpty || seg.kind != staticSegment || seg.literal != "" {
+				return fail()
+			}
+			terminalEmpty = false
+		}
+		part := remaining
+		if slash := strings.IndexByte(remaining, '/'); slash >= 0 {
+			part, remaining = remaining[:slash], remaining[slash+1:]
+		} else {
+			remaining = ""
+		}
+		switch seg.kind {
+		case staticSegment:
+			if part != seg.literal {
+				return fail()
+			}
+		case parameterSegment:
+			ctx.URLParams.Keys = append(ctx.URLParams.Keys, seg.name)
+			ctx.URLParams.Values = append(ctx.URLParams.Values, part)
+		case regexSegment:
+			if len(seg.names) == 0 {
+				if !seg.expression.MatchString(part) {
+					return fail()
+				}
+				ctx.URLParams.Keys = append(ctx.URLParams.Keys, seg.name)
+				ctx.URLParams.Values = append(ctx.URLParams.Values, part)
+			} else {
+				matches := seg.expression.FindStringSubmatch(part)
+				if matches == nil {
+					return fail()
+				}
+				for index, name := range seg.names {
+					capture := seg.captureIndices[index]
+					ctx.URLParams.Keys = append(ctx.URLParams.Keys, name)
+					ctx.URLParams.Values = append(ctx.URLParams.Values, matches[capture])
+				}
+			}
+		}
+	}
+	if remaining != "" || terminalEmpty {
+		return fail()
+	}
+	return true
+}
+func (s *Snapshot) match(ctx *Context, method, path string) http.Handler {
+	for _, candidates := range [2][]compiledRoute{s.dynamic[method], s.dynamic["*"]} {
+		for _, candidate := range candidates {
+			if matchRoute(candidate, path, ctx) {
+				ctx.routePattern = candidate.Pattern
+				return candidate.Handler
+			}
+		}
+	}
+	return nil
+}
+func (s *Snapshot) allowedMethods(path string) []string {
+	allowed := make([]string, 0)
+	for method := range s.methods {
+		if _, ok := s.exact[routeKey(method, path)]; ok {
+			allowed = append(allowed, method)
+			continue
+		}
+		ctx := &Context{}
+		if s.match(ctx, method, path) != nil {
+			allowed = append(allowed, method)
+		}
+	}
+	sort.Strings(allowed)
+	return allowed
+}
+func (s *Snapshot) Match(ctx *Context, method, path string) bool {
+	method = strings.ToUpper(method)
+	if _, ok := s.exact[routeKey(method, path)]; ok {
+		ctx.routePattern = path
+		return true
+	}
+	if _, ok := s.exact[routeKey("*", path)]; ok {
+		ctx.routePattern = path
+		return true
+	}
+	return s.match(ctx, method, path) != nil
+}
+func (s *Snapshot) Resolve(method, path string) MatchOutcome {
+	method = strings.ToUpper(method)
+	if handler, ok := s.exact[routeKey(method, path)]; ok {
+		for _, info := range s.routes {
+			if info.Method == method && info.Pattern == path {
+				info.ParamNames = append([]string(nil), info.ParamNames...)
+				info.Handler = handler
+				return MatchedRoute(info, map[string]string{})
+			}
+		}
+	}
+	if handler, ok := s.exact[routeKey("*", path)]; ok {
+		for _, info := range s.routes {
+			if info.Method == "*" && info.Pattern == path {
+				info.ParamNames = append([]string(nil), info.ParamNames...)
+				info.Handler = handler
+				return MatchedRoute(info, map[string]string{})
+			}
+		}
+	}
+	ctx := NewRouteContext()
+	if handler := s.match(ctx, method, path); handler != nil {
+		params := make(map[string]string, len(ctx.URLParams.Keys))
+		for i, key := range ctx.URLParams.Keys {
+			params[key] = ctx.URLParams.Values[i]
+		}
+		for _, info := range s.routes {
+			if (info.Method == method || info.Method == "*") && info.Pattern == ctx.routePattern {
+				info.ParamNames = append([]string(nil), info.ParamNames...)
+				info.Handler = handler
+				return MatchedRoute(info, params)
+			}
+		}
+	}
+	allowed := make([]string, 0)
+	for candidate := range s.methods {
+		if candidate == method || candidate == "*" {
+			continue
+		}
+		if _, ok := s.exact[routeKey(candidate, path)]; ok {
+			allowed = append(allowed, candidate)
+			continue
+		}
+		probe := NewRouteContext()
+		if s.match(probe, candidate, path) != nil {
+			allowed = append(allowed, candidate)
+		}
+	}
+	if len(allowed) != 0 {
+		sort.Strings(allowed)
+		return MethodMismatch(allowed)
+	}
+	return RouteMissing
+}
+func (m *Mux) Match(ctx *Context, method, path string) bool {
+	return m.root().snapshot().Match(ctx, method, path)
+}
+func (m *Mux) Find(ctx *Context, method, path string) string {
+	if m.Match(ctx, method, path) {
+		return ctx.routePattern
+	}
+	return ""
+}
+
+type WalkFunc func(method, route string, handler http.Handler, middlewares ...func(http.Handler) http.Handler) error
+
+func Walk(r Routes, walkFn WalkFunc) error {
+	return walkRoutes(r, walkFn, nil, "")
+}
+
+func walkRoutes(r Routes, walkFn WalkFunc, inherited Middlewares, parent string) error {
+	for _, route := range r.Routes() {
+		middlewares := append(append(Middlewares(nil), inherited...), r.Middlewares()...)
+		if route.SubRoutes != nil {
+			if handler, ok := route.Handlers["*"]; ok {
+				if chain, ok := handler.(*ChainHandler); ok {
+					middlewares = append(middlewares, chain.Middlewares...)
+				}
+			}
+			if err := walkRoutes(route.SubRoutes, walkFn, middlewares, parent+route.Pattern); err != nil {
+				return err
+			}
+			continue
+		}
+		for method, handler := range route.Handlers {
+			if method == "*" {
+				continue
+			}
+			fullRoute := strings.ReplaceAll(parent+route.Pattern, "/*/", "/")
+			if chain, ok := handler.(*ChainHandler); ok {
+				if err := walkFn(method, fullRoute, chain.Endpoint, append(middlewares, chain.Middlewares...)...); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := walkFn(method, fullRoute, handler, middlewares...); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func Chain(middlewares ...func(http.Handler) http.Handler) Middlewares {
+	return append(Middlewares(nil), middlewares...)
+}
+func NewChain(middlewares ...func(http.Handler) http.Handler) Middlewares {
+	return Chain(middlewares...)
+}
+func (middlewares Middlewares) Handler(handler http.Handler) http.Handler {
+	endpoint := handler
+	for i := len(middlewares) - 1; i >= 0; i-- {
+		handler = middlewares[i](handler)
+	}
+	return &ChainHandler{Endpoint: endpoint, chain: handler, Middlewares: append(Middlewares(nil), middlewares...)}
+}
+func (middlewares Middlewares) HandlerFunc(handler http.HandlerFunc) http.Handler {
+	return middlewares.Handler(handler)
+}
+
+type ChainHandler struct {
+	Endpoint    http.Handler
+	chain       http.Handler
+	Middlewares Middlewares
+}
+
+func (handler *ChainHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	handler.chain.ServeHTTP(w, r)
+}

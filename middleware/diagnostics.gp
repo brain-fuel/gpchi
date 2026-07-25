@@ -1,0 +1,55 @@
+package middleware
+
+import (
+	"expvar"
+	"net/http"
+	"net/http/pprof"
+	"os"
+
+	chi "goforge.dev/gpchi"
+)
+
+var IsTTY = stdoutIsTTY()
+
+func stdoutIsTTY() bool {
+	info, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	mode := os.ModeDevice | os.ModeCharDevice
+	return info.Mode()&mode == mode
+}
+
+func Profiler() http.Handler {
+	router := chi.NewRouter()
+	router.Use(NoCache)
+	router.Get("/", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, r.RequestURI+"/pprof/", http.StatusMovedPermanently)
+	})
+	router.HandleFunc("/pprof", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, r.RequestURI+"/", http.StatusMovedPermanently)
+	})
+	router.HandleFunc("/pprof/*", pprof.Index)
+	router.HandleFunc("/pprof/cmdline", pprof.Cmdline)
+	router.HandleFunc("/pprof/profile", pprof.Profile)
+	router.HandleFunc("/pprof/symbol", pprof.Symbol)
+	router.HandleFunc("/pprof/trace", pprof.Trace)
+	router.Handle("/vars", expvar.Handler())
+	for _, profile := range []string{"goroutine", "threadcreate", "mutex", "heap", "block", "allocs"} {
+		router.Handle("/pprof/"+profile, pprof.Handler(profile))
+	}
+	return router
+}
+
+func SupressNotFound(router *chi.Mux) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			routeContext := chi.RouteContext(r.Context())
+			if !routeContext.Routes.Match(routeContext, r.Method, r.URL.Path) {
+				router.NotFoundHandler().ServeHTTP(w, r)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}

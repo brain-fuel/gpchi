@@ -1,0 +1,119 @@
+package middleware
+
+import (
+	"net/http"
+	"strings"
+)
+
+type Pattern struct {
+	prefix   string
+	suffix   string
+	wildcard bool
+}
+
+func NewPattern(value string) Pattern {
+	prefix, suffix, wildcard := strings.Cut(value, "*")
+	return Pattern{prefix: prefix, suffix: suffix, wildcard: wildcard}
+}
+
+func (pattern Pattern) Match(value string) bool {
+	if !pattern.wildcard {
+		return value == pattern.prefix
+	}
+	return len(value) >= len(pattern.prefix)+len(pattern.suffix) &&
+		strings.HasPrefix(value, pattern.prefix) &&
+		strings.HasSuffix(value, pattern.suffix)
+}
+
+type HeaderRoute struct {
+	Middleware func(http.Handler) http.Handler
+	MatchOne   Pattern
+	MatchAny   []Pattern
+}
+
+func (route HeaderRoute) IsMatch(value string) bool {
+	if len(route.MatchAny) == 0 {
+		return route.MatchOne.Match(value)
+	}
+	for _, pattern := range route.MatchAny {
+		if pattern.Match(value) {
+			return true
+		}
+	}
+	return false
+}
+
+type HeaderRouter map[string][]HeaderRoute
+
+func RouteHeaders() HeaderRouter {
+	return HeaderRouter{}
+}
+
+func (router HeaderRouter) Route(header, match string, middleware func(http.Handler) http.Handler) HeaderRouter {
+	header = strings.ToLower(header)
+	router[header] = append(router[header], HeaderRoute{
+		Middleware: middleware,
+		MatchOne:   NewPattern(match),
+	})
+	return router
+}
+
+func (router HeaderRouter) RouteAny(header string, matches []string, middleware func(http.Handler) http.Handler) HeaderRouter {
+	header = strings.ToLower(header)
+	patterns := make([]Pattern, 0, len(matches))
+	for _, match := range matches {
+		patterns = append(patterns, NewPattern(match))
+	}
+	router[header] = append(router[header], HeaderRoute{
+		Middleware: middleware,
+		MatchAny:   patterns,
+	})
+	return router
+}
+
+func (router HeaderRouter) RouteDefault(middleware func(http.Handler) http.Handler) HeaderRouter {
+	router["*"] = []HeaderRoute{{Middleware: middleware}}
+	return router
+}
+
+func (router HeaderRouter) Handler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for header, routes := range router {
+			value := r.Header.Get(header)
+			if value == "" {
+				continue
+			}
+			value = strings.ToLower(value)
+			for _, route := range routes {
+				if route.IsMatch(value) {
+					route.Middleware(next).ServeHTTP(w, r)
+					return
+				}
+			}
+		}
+		defaults := router["*"]
+		if len(defaults) != 0 && defaults[0].Middleware != nil {
+			defaults[0].Middleware(next).ServeHTTP(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func PageRoute(path string, page http.Handler) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet && strings.EqualFold(r.URL.Path, path) {
+				page.ServeHTTP(w, r)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func New(handler http.Handler) func(http.Handler) http.Handler {
+	return func(http.Handler) http.Handler {
+		return handler
+	}
+}
