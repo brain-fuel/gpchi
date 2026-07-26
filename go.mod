@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/go-chi/chi/v5 v5.3.1
-	goforge.dev/goplus/std v0.201.0
+	goforge.dev/goplus/std v0.207.0
 )
 
 require (
